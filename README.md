@@ -693,6 +693,310 @@ Collect separate sessions for labels 1 and 2 using the runtime label switch befo
 | WHO_AM_I check for `0x70` only | Will reject MPU-6050 clones returning `0x68` | Accept both values, print warning not fatal error |
 
 ---
+---
+
+## What's New in V1.0.1
+
+V2 extends the firmware from a pure training platform into a complete on-device machine learning lifecycle — **train**, **persist**, and **infer** — all without leaving the microcontroller. The table below summarises what runs in each mode:
+
+| Mode | Forward pass | Backward pass | W1 / W2 update | Serial prefix |
+|------|:---:|:---:|:---:|:---:|
+| `MODE_TRAIN` | ✅ | ✅ | ✅ | `[TRAIN]` |
+| `MODE_INFER` | ✅ | ❌ | ❌ | `[INFER]` |
+
+---
+
+## Training Mode — Usage & Technical Reference
+
+### What happens during a training step
+
+Every completed 1-second feature window triggers the following sequence in `runTraining()`:
+
+```
+forward(featureVec, nnOutput)
+  └─ hidden pre-activations  z1[j] = b1[j] + Σᵢ w1[i·16+j] · featureVec[i]
+  └─ hidden activations      a1[j] = σ(z1[j])
+  └─ output pre-activations  z2[k] = b2[k] + Σⱼ w2[j·3+k]  · a1[j]
+  └─ output activations      a2[k] = σ(z2[k])   ← class probabilities
+
+backward(target, lr)
+  └─ output deltas   δ_out[k] = (a2[k] − target[k]) · σ'(a2[k])
+  └─ hidden deltas   δ_hid[j] = (Σₖ δ_out[k] · w2[j·3+k]) · σ'(a1[j])
+  └─ update W2       w2[j,k] -= lr · δ_out[k] · a1[j]
+  └─ update b2       b2[k]   -= lr · δ_out[k]
+  └─ update b1       b1[j]   -= lr · δ_hid[j]
+  └─ stash δ_hid into _z1    (temp buffer for updateW1)
+
+updateW1(featureVec, lr)          ← MUST follow backward() immediately
+  └─ update W1       w1[i,j] -= lr · _z1[j] · featureVec[i]
+```
+
+The two-call W1 update pattern (`backward()` then `updateW1()`) exists entirely to avoid storing a second copy of the 500-float feature vector inside the `NeuralNetwork` class object. `backward()` stashes `δ_hid` into the `_z1` buffer (which is no longer needed as a pre-activation cache until the next `forward()` call), and `updateW1()` consumes it using the caller's still-live `featureVec[]`. Do not insert any code between these two calls.
+
+### Loss function and convergence signal
+
+The loss reported on each `[TRAIN]` line is **Mean Squared Error** averaged across the three output nodes:
+
+```
+MSE = (1/3) · Σₖ (a2[k] − target[k])²
+```
+
+For a well-initialised Xavier network with `lr = 0.01`, expect:
+- Steps 1–10: loss drops sharply from ~0.35 toward ~0.15 as the network breaks symmetry
+- Steps 10–50: steady monotonic descent; `out[label]` climbs toward 1.0; the other two nodes fall
+- Steps 50+: diminishing returns; loss typically plateaus between 0.05 and 0.10 for a single-class session
+
+The network uses **online gradient descent** (one weight update per window, not per epoch over a dataset). This matches the federated learning paper's methodology and is deliberately chosen to minimise RAM — there is no replay buffer.
+
+### Activation function
+
+Both the hidden and output layers use **sigmoid**:
+
+```
+σ(x)  = 1 / (1 + e⁻ˣ)
+σ'(x) = a · (1 − a)     where a = σ(x)   ← computed from the activation, not the pre-activation
+```
+
+The derivative is evaluated from the cached activation value `_a1[j]` / `_a2[k]`, avoiding a redundant `expf()` call per neuron. Output activations are independent probabilities in `[0, 1]` — sigmoid is used rather than softmax because the paper's methodology treats each class output as an independent binary estimator, and softmax would couple the gradients across classes in a way that is harder to aggregate under FedAvg.
+
+### Weight initialisation
+
+Weights are Xavier-uniform with a fixed seed:
+
+```
+W1 limit = √(6 / (500 + 16)) = 0.1078   →   W1 ∈ [−0.1078, +0.1078]
+W2 limit = √(6 / ( 16 +  3)) = 0.5623   →   W2 ∈ [−0.5623, +0.5623]
+b1 = b2 = 0.01
+srand(42)
+```
+
+`srand(42)` pins the random seed so that two devices starting from the same seed produce identical initial weights. This matters for federated averaging: if devices diverge from the same starting point, the FedAvg global model averages comparable parameter spaces rather than misaligned ones.
+
+### How to use Training mode
+
+**Step 1 — Flash and open the serial monitor**
+
+```bash
+pio run --target upload
+pio device monitor --baud 115200
+```
+
+On first boot with no saved model you will see:
+
+```
+[MAIN] No saved model — starting in TRAINING mode
+[MAIN] Mode: TRAINING  Label: 0 (IDLE)  LR: 0.0100
+```
+
+**Step 2 — Collect class 0 (IDLE)**
+
+Place the sensor stationary. The device is already labelling incoming windows as class 0. Watch the `[TRAIN]` lines:
+
+```
+[TRAIN] step=   1  label=0  out=[0.2584  0.2991  0.6396]  loss=0.349487
+[TRAIN] step=   2  label=0  out=[0.3812  0.2204  0.5110]  loss=0.241063
+...
+[TRAIN] step=  50  label=0  out=[0.6016  0.1406  0.3350]  loss=0.096908
+```
+
+Wait until `out[0]` is comfortably above 0.5 and loss has flattened (typically 50–80 windows, ~50–80 seconds).
+
+**Step 3 — Switch to class 1 (LOW\_VIB)**
+
+Send `1` in the serial monitor. Apply your low-frequency excitation source (motor at low RPM, tapping, etc.):
+
+```
+[CMD] Label set to 1 (LOW_VIB)
+[TRAIN] step=  51  label=1  out=[0.5943  0.1289  0.3197]  loss=0.298841
+...
+```
+
+`out[1]` should climb while `out[0]` and `out[2]` suppress. Allow ≥50 windows.
+
+**Step 4 — Switch to class 2 (HIGH\_VIB)**
+
+Send `2`. Apply high-frequency excitation. Allow ≥50 windows.
+
+**Step 5 — Save and verify**
+
+```
+s        ← send over serial
+[CMD] Model saved — will auto-load on next boot
+```
+
+Send `i` to immediately switch to inference mode and verify predictions without reflashing.
+
+**Tips**
+
+- Set `DEBUG_ANGLES 0` in `main.cpp` for production or long training runs — at 100 Hz, angle printouts consume ~8 KB/s of serial bandwidth and add measurable latency jitter.
+- Every 50 steps the firmware automatically prints a W2 snapshot (`[NN] W2 snapshot:`) and heap stats. Use these to confirm the network has not saturated (all weights near ±limit) or died (all weights near zero).
+- To reset training from scratch without reflashing, cycle power (or hard-reset) with no `/snx_model.bin` on flash, or erase with `pio run --target erase`.
+
+---
+
+## Inference Mode — Usage & Technical Reference
+
+### What happens during an inference step
+
+Every completed 1-second feature window triggers the following sequence in `runInference()`:
+
+```
+forward(featureVec, nnOutput)
+  └─ same forward pass as training (see above)
+  └─ _a2[0..2] populated with class probabilities
+
+argmax()
+  └─ scans _a2[] — no recomputation, reads the cache populated by forward()
+  └─ returns index k* where a2[k*] = max(a2[0], a2[1], a2[2])
+```
+
+No `backward()`, no `updateW1()` — the weight arrays are never written. The model is frozen at whatever state it was in when `saveToLittleFS()` was last called.
+
+### Classification rule
+
+The predicted class is simply the output neuron with the highest activation:
+
+```
+k* = argmax({ a2[0], a2[1], a2[2] })
+```
+
+Because sigmoid outputs are independent (not softmax-normalised), the three activations do not sum to 1. Each value should be read as the network's independent confidence that the window belongs to that class. A healthy inference log looks like:
+
+```
+[INFER] step=   1  pred=IDLE     (0)  out=[0.8812  0.0934  0.1205]
+[INFER] step=   2  pred=IDLE     (0)  out=[0.8749  0.1013  0.1188]
+```
+
+The winning class has a clearly dominant activation (>0.7) while the others are suppressed (<0.2). If activations are bunched together (e.g. `[0.42  0.38  0.35]`), the model is uncertain — usually because that vibration condition was underrepresented during training or the sensor is experiencing a condition outside the training distribution.
+
+### Confidence interpretation
+
+| `out[k*]` range | Interpretation |
+|---|---|
+| > 0.80 | High confidence — class boundary well-learnt |
+| 0.60 – 0.80 | Moderate confidence — consider more training windows |
+| 0.50 – 0.60 | Low confidence — ambiguous; class separation insufficient |
+| < 0.50 | Prediction unreliable — argmax wins but no class dominates |
+
+These thresholds are heuristics based on sigmoid output characteristics, not calibrated probabilities. For a deployment that needs calibrated uncertainty, consider adding a rejection threshold: if `a2[k*] < threshold`, emit a `UNKNOWN` label rather than a forced classification.
+
+### Model Persistence (LittleFS)
+
+V2 persists the full model to the on-chip flash filesystem so weights survive power cycles.
+
+**Why LittleFS and not NVS?**
+
+ESP32 NVS has a hard **4 KB per-key limit**. W1 alone occupies `500 × 16 × 4 = 32 000 bytes`. LittleFS stores arbitrary-size binary files on the same 8 MB flash chip with no such restriction. The blob layout is:
+
+```
+/snx_model.bin
+├── W1   [8 000 floats × 4 B = 32 000 B]   row-major [input_idx × 16 + hidden_idx]
+├── W2   [   48 floats × 4 B =    192 B]   row-major [hidden_idx × 3  + output_idx]
+├── b1   [   16 floats × 4 B =     64 B]
+└── b2   [    3 floats × 4 B =     12 B]
+                              ──────────
+                    Total      32 268 B   (≈ 31.5 KB)
+```
+
+`loadFromLittleFS()` checks `file.size() == MODEL_BLOB_BYTES` before reading a single byte. If the size does not match exactly (partial write, flash corruption, architecture change), the file is rejected and the firmware falls back to `nn.init()` rather than loading garbage weights silently.
+
+**Setup (one-time)**
+
+Add to `platformio.ini`:
+
+```ini
+board_build.filesystem = littlefs
+```
+
+Run once to initialise the filesystem partition on a blank device:
+
+```bash
+pio run --target uploadfs
+```
+
+This only needs to be done once per device. Subsequent `pio run --target upload` firmware flashes do not erase the LittleFS partition.
+
+### Auto-Boot Behaviour
+
+`setup()` attempts `loadFromLittleFS()` before calling `nn.init()`:
+
+```
+Boot
+ │
+ ├─ loadFromLittleFS() succeeds?
+ │    YES → weights restored → opMode = MODE_INFER
+ │           "[MAIN] Saved model loaded — starting in INFERENCE mode"
+ │
+ └─ NO  → nn.init() (Xavier fresh start) → opMode = MODE_TRAIN
+           "[MAIN] No saved model — starting in TRAINING mode"
+```
+
+A fully trained and saved device behaves like a finished product on every subsequent power-on — connect power, `[INFER]` lines start appearing within 1 second of the first complete window.
+
+### How to use Inference mode
+
+**Entering inference mode**
+
+Three ways:
+
+1. **Automatic on boot** — if `/snx_model.bin` exists on flash (most common after first save).
+2. **Serial command `i`** — switch live from training without reflashing or power-cycling.
+3. **Serial command `l`** — explicitly reload the saved model from flash and enter inference.
+
+**Reading the inference log**
+
+```
+[INFER] step=   1  pred=IDLE     (0)  out=[0.8812  0.0934  0.1205]
+         │          │             │    │
+         │          │             │    └── raw sigmoid activations for all 3 classes
+         │          │             └─────── winning class index
+         │          └───────────────────── winning class name
+         └──────────────────────────────── window count since entering INFER mode
+```
+
+`inferStep` resets to 0 each time `MODE_INFER` is entered. Every 50 inference windows the firmware prints a RAM health report (`[SYS]` lines) identical to the one emitted during training.
+
+**Returning to training mode**
+
+Send `t` at any time. The model in RAM is unchanged — inference does not modify weights — so you can freely switch back and forth to compare the live model's training loss against its inference predictions on the same window.
+
+**Saving after fine-tuning**
+
+```
+t        ← enter training mode
+          (fine-tune for N windows)
+s        ← overwrite /snx_model.bin with updated weights
+i        ← return to inference
+```
+
+The save overwrites the previous blob atomically (LittleFS `"w"` open truncates on write). There is no versioning — the last save always wins.
+
+---
+
+## Complete V2 Serial Command Reference
+
+| Key | Mode required | Action |
+|-----|:---:|--------|
+| `0` | TRAIN | Set active label → Class 0 (IDLE) |
+| `1` | TRAIN | Set active label → Class 1 (LOW\_VIB) |
+| `2` | TRAIN | Set active label → Class 2 (HIGH\_VIB) |
+| `t` / `T` | any | Switch to **TRAINING** mode |
+| `i` / `I` | any | Switch to **INFERENCE** mode (resets `inferStep`) |
+| `s` / `S` | any | Save weights to `/snx_model.bin` on LittleFS |
+| `l` / `L` | any | Load weights from `/snx_model.bin` → enter INFERENCE |
+| `w` / `W` | any | Dump all 8 067 parameters as IEEE-754 hex stream |
+
+---
+
+## Internal Refactoring (V1 → V2)
+
+- **`predict()` removed** — it redundantly re-ran `forward()` after `main.cpp` had already called it, performing a full 500 × 16 MAC pass for nothing. Replaced by `argmax()`, which reads `_a2[]` already populated by the preceding `forward()` call at zero additional cost.
+- **`saveToNVS()` / `loadFromNVS()` removed** — NVS 4 KB/key limit cannot accommodate W1 (32 KB). Replaced by `saveToLittleFS()` / `loadFromLittleFS()`.
+- **`MODEL_BLOB_BYTES` is `constexpr`** — the LittleFS integrity check is derived at compile time from the actual array dimension macros, not a hardcoded magic number. Any change to `NN_INPUT_SIZE` or `NN_HIDDEN_SIZE` automatically updates the check.
+- **`runInference()` and `runTraining()` extracted** — `loop()` is now a single `if/else` dispatch; all per-mode logic is encapsulated in its own function.
+- **`inferStep` counter** — inference gets its own step counter (resets on each entry to `MODE_INFER`) so `[INFER]` log lines are independently meaningful and the 50-step RAM report cadence is maintained in both modes.
+
+---
 
 ## License
 
